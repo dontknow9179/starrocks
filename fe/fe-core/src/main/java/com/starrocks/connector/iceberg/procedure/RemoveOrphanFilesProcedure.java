@@ -115,6 +115,14 @@ public class RemoveOrphanFilesProcedure extends IcebergTableProcedure {
             location = table.location();
         }
 
+        String location;
+        ConstantOperator locationArg = args.get(LOCATION);
+        if (locationArg != null) {
+            location = locationArg.getVarchar();
+        } else {
+            location = table.location();
+        }
+
         Set<String> processedManifestFilePaths = new HashSet<>();
         Set<String> validFileNames = new HashSet<>();
 

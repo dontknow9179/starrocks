@@ -136,6 +136,15 @@ public class AlterTableOperationStmtTest {
     }
 
     @Test
+    public void testRewriteManifestsProcedure() {
+        String sql = "ALTER TABLE iceberg_catalog.iceberg_db.test_table EXECUTE rewrite_manifests()";
+        StatementBase stmt = AnalyzeTestUtil.analyzeSuccess(sql);
+        Assertions.assertInstanceOf(AlterTableStmt.class, stmt);
+        AlterTableStmt alterStmt = (AlterTableStmt) stmt;
+        Assertions.assertEquals("test_table", alterStmt.getTableName());
+    }
+
+    @Test
     public void testFastForwardProcedure() {
         String sql = "ALTER TABLE iceberg_catalog.iceberg_db.test_table EXECUTE fast_forward(from_branch = 'source', to_branch = 'target')";
         StatementBase stmt = AnalyzeTestUtil.analyzeSuccess(sql);
