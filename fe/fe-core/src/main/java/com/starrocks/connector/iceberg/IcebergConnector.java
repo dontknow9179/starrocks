@@ -136,6 +136,15 @@ public class IcebergConnector implements Connector {
                         .registerCachingIcebergCatalog(catalogName, nativeCatalog);
             }
             this.icebergNativeCatalog = nativeCatalog;
+
+            int cleanupHours = icebergCatalogProperties.getOptimizationAutoCleanupIntervalHours();
+            int rewriteHours = icebergCatalogProperties.getOptimizationAutoRewriteManifestsIntervalHours();
+            if (!isResourceMappingCatalog(catalogName) && icebergCatalogProperties.isEnableAutoMaintenance()
+                    && (cleanupHours > 0 || rewriteHours > 0)) {
+                GlobalStateMgr.getCurrentState().getIcebergMaintenanceProcessor()
+                        .registerIcebergCatalogForMaintenance(catalogName, icebergNativeCatalog, hdfsEnvironment,
+                                cleanupHours, rewriteHours);
+            }
         }
         return icebergNativeCatalog;
     }
