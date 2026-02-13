@@ -17,6 +17,7 @@ package com.starrocks.connector.iceberg;
 import com.google.common.collect.Lists;
 import com.starrocks.common.Config;
 import com.starrocks.common.Pair;
+import com.starrocks.common.ThreadPoolManager;
 import com.starrocks.common.util.FrontendDaemon;
 import com.starrocks.connector.HdfsEnvironment;
 import com.starrocks.connector.iceberg.procedure.ExpireSnapshotsProcedure;
@@ -31,6 +32,8 @@ import org.apache.logging.log4j.Logger;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 
 /**
  * Standalone processor for Iceberg catalog metadata auto maintenance (expire_snapshots,
@@ -41,10 +44,24 @@ import java.util.concurrent.ConcurrentHashMap;
 public class IcebergMaintenanceProcessor extends FrontendDaemon {
     private static final Logger LOG = LogManager.getLogger(IcebergMaintenanceProcessor.class);
 
+    // Thread pool for executing per-table metadata maintenance tasks. This allows concurrent
+    // processing of tables across catalogs while keeping the daemon loop simple.
+    private static final int MAINTENANCE_THREAD_NUM =
+            Math.max(1, Math.min(Config.iceberg_background_maintenance_pool_size, Runtime.getRuntime().availableProcessors()));
+    private static final int MAINTENANCE_QUEUE_SIZE = Integer.MAX_VALUE;
+
     private final ConcurrentHashMap<String, IcebergMaintenanceInfo> maintenanceInfoMap = new ConcurrentHashMap<>();
+    private final ExecutorService maintenanceExecutor;
 
     public IcebergMaintenanceProcessor() {
-        super(IcebergMaintenanceProcessor.class.getName(), Config.background_refresh_metadata_interval_millis);
+        super(IcebergMaintenanceProcessor.class.getName(),
+                Config.iceberg_background_check_maintenance_interval_secs * 1000L);
+
+        this.maintenanceExecutor = ThreadPoolManager.newDaemonFixedThreadPool(
+                MAINTENANCE_THREAD_NUM,
+                MAINTENANCE_QUEUE_SIZE,
+                "iceberg-maintenance-pool",
+                true);
     }
 
     private static class IcebergMaintenanceInfo {
@@ -72,9 +89,6 @@ public class IcebergMaintenanceProcessor extends FrontendDaemon {
     public void registerIcebergCatalogForMaintenance(String catalogName, IcebergCatalog catalog,
                                                      HdfsEnvironment hdfsEnvironment,
                                                      int cleanupIntervalHours, int rewriteIntervalHours) {
-        if (cleanupIntervalHours <= 0 && rewriteIntervalHours <= 0) {
-            return;
-        }
         LOG.info("Register iceberg catalog {} for auto maintenance: cleanup_interval_hours={}, rewrite_manifests_interval_hours={}",
                 catalogName, cleanupIntervalHours, rewriteIntervalHours);
         maintenanceInfoMap.put(catalogName,
@@ -108,13 +122,13 @@ public class IcebergMaintenanceProcessor extends FrontendDaemon {
             if (cleanupDue) {
                 LOG.info("Start auto maintenance cleanup (expire_snapshots + remove_orphan_files) on iceberg catalog {}",
                         info.catalogName);
-                runCleanupForCatalog(info, tableNames, ctx);
+                runCleanupForCatalog(info, tableNames);
                 info.lastCleanupTimeMillis = now;
                 LOG.info("Finish auto maintenance cleanup on iceberg catalog {}", info.catalogName);
             }
             if (rewriteDue) {
                 LOG.info("Start auto maintenance rewrite_manifests on iceberg catalog {}", info.catalogName);
-                runRewriteManifestsForCatalog(info, tableNames, ctx);
+                runRewriteManifestsForCatalog(info, tableNames);
                 info.lastRewriteTimeMillis = now;
                 LOG.info("Finish auto maintenance rewrite_manifests on iceberg catalog {}", info.catalogName);
             }
@@ -141,60 +155,85 @@ public class IcebergMaintenanceProcessor extends FrontendDaemon {
         return result;
     }
 
-    private void runCleanupForCatalog(IcebergMaintenanceInfo info, List<Pair<String, String>> tableNames,
-                                     ConnectContext ctx) {
+    private void runCleanupForCatalog(IcebergMaintenanceInfo info, List<Pair<String, String>> tableNames) {
+        List<Future<?>> futures = Lists.newArrayListWithCapacity(tableNames.size());
         for (Pair<String, String> name : tableNames) {
-            try {
-                org.apache.iceberg.Table table = info.catalog.getTable(ctx, name.first, name.second);
-                if (table == null || table.currentSnapshot() == null) {
-                    continue;
+            Future<?> future = maintenanceExecutor.submit(() -> {
+                ConnectContext taskCtx = new ConnectContext();
+                try {
+                    org.apache.iceberg.Table table = info.catalog.getTable(taskCtx, name.first, name.second);
+                    if (table == null || table.currentSnapshot() == null) {
+                        return;
+                    }
+                    runExpireSnapshots(info.catalog, table, info.hdfsEnvironment);
+                    runRemoveOrphanFiles(info.catalog, table, info.hdfsEnvironment);
+                } catch (Exception e) {
+                    LOG.warn("Auto maintenance cleanup failed on {}.{}.{}: {}",
+                            info.catalogName, name.first, name.second, e.getMessage(), e);
                 }
-                runExpireSnapshots(info.catalog, table, ctx, info.hdfsEnvironment);
-                runRemoveOrphanFiles(info.catalog, table, ctx, info.hdfsEnvironment);
+            });
+            futures.add(future);
+        }
+        // Wait for all cleanup tasks for this catalog to complete to avoid unbounded
+        // task accumulation across daemon cycles while still leveraging thread pool concurrency.
+        for (Future<?> future : futures) {
+            try {
+                future.get();
             } catch (Exception e) {
-                LOG.warn("Auto maintenance cleanup failed on {}.{}.{}: {}",
-                        info.catalogName, name.first, name.second, e.getMessage(), e);
+                LOG.warn("Unexpected exception while waiting for cleanup task completion", e);
             }
         }
     }
 
-    private void runRewriteManifestsForCatalog(IcebergMaintenanceInfo info, List<Pair<String, String>> tableNames,
-                                               ConnectContext ctx) {
+    private void runRewriteManifestsForCatalog(IcebergMaintenanceInfo info, List<Pair<String, String>> tableNames) {
+        List<Future<?>> futures = Lists.newArrayListWithCapacity(tableNames.size());
         for (Pair<String, String> name : tableNames) {
-            try {
-                org.apache.iceberg.Table table = info.catalog.getTable(ctx, name.first, name.second);
-                if (table == null || table.currentSnapshot() == null) {
-                    continue;
+            Future<?> future = maintenanceExecutor.submit(() -> {
+                ConnectContext taskCtx = new ConnectContext();
+                try {
+                    org.apache.iceberg.Table table = info.catalog.getTable(taskCtx, name.first, name.second);
+                    if (table == null || table.currentSnapshot() == null) {
+                        return;
+                    }
+                    runRewriteManifests(info.catalog, table, info.hdfsEnvironment);
+                } catch (Exception e) {
+                    LOG.warn("Auto maintenance rewrite_manifests failed on {}.{}.{}: {}",
+                            info.catalogName, name.first, name.second, e.getMessage(), e);
                 }
-                runRewriteManifests(info.catalog, table, ctx, info.hdfsEnvironment);
+            });
+            futures.add(future);
+        }
+        // Wait for all rewrite manifests tasks for this catalog to complete.
+        for (Future<?> future : futures) {
+            try {
+                future.get();
             } catch (Exception e) {
-                LOG.warn("Auto maintenance rewrite_manifests failed on {}.{}.{}: {}",
-                        info.catalogName, name.first, name.second, e.getMessage(), e);
+                LOG.warn("Unexpected exception while waiting for rewrite_manifests task completion", e);
             }
         }
     }
 
-    private void runExpireSnapshots(IcebergCatalog catalog, org.apache.iceberg.Table table, ConnectContext ctx,
+    private void runExpireSnapshots(IcebergCatalog catalog, org.apache.iceberg.Table table,
                                     HdfsEnvironment hdfsEnvironment) {
         Transaction txn = table.newTransaction();
         IcebergTableProcedureContext procedureContext = new IcebergTableProcedureContext(
-                catalog, table, ctx, txn, hdfsEnvironment, null, null);
+                catalog, table, null, txn, hdfsEnvironment, null, null);
         ExpireSnapshotsProcedure.getInstance().execute(procedureContext, Collections.emptyMap());
     }
 
-    private void runRemoveOrphanFiles(IcebergCatalog catalog, org.apache.iceberg.Table table, ConnectContext ctx,
+    private void runRemoveOrphanFiles(IcebergCatalog catalog, org.apache.iceberg.Table table,
                                       HdfsEnvironment hdfsEnvironment) {
         Transaction txn = table.newTransaction();
         IcebergTableProcedureContext procedureContext = new IcebergTableProcedureContext(
-                catalog, table, ctx, txn, hdfsEnvironment, null, null);
+                catalog, table, null, txn, hdfsEnvironment, null, null);
         RemoveOrphanFilesProcedure.getInstance().execute(procedureContext, Collections.emptyMap());
     }
 
-    private void runRewriteManifests(IcebergCatalog catalog, org.apache.iceberg.Table table, ConnectContext ctx,
+    private void runRewriteManifests(IcebergCatalog catalog, org.apache.iceberg.Table table,
                                     HdfsEnvironment hdfsEnvironment) {
         Transaction txn = table.newTransaction();
         IcebergTableProcedureContext procedureContext = new IcebergTableProcedureContext(
-                catalog, table, ctx, txn, hdfsEnvironment, null, null);
+                catalog, table, null, txn, hdfsEnvironment, null, null);
         RewriteManifestsProcedure.getInstance().execute(procedureContext, Collections.emptyMap());
     }
 }
