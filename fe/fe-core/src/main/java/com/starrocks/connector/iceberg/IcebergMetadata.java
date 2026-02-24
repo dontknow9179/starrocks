@@ -632,6 +632,7 @@ public class IcebergMetadata implements ConnectorMetadata {
             table.setComment(icebergTable.properties().getOrDefault(COMMENT, ""));
             tables.put(identifier, icebergTable);
             updateTableProperty(db, table);
+            IcebergTableAccessTimeTracker.getInstance().recordAccess(catalogName, dbName, tblName);
             return table;
         } catch (StarRocksConnectorException e) {
             LOG.error("Failed to get iceberg table {}", identifier, e);

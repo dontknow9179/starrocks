@@ -19,6 +19,7 @@ import com.starrocks.common.Config;
 import com.starrocks.common.Pair;
 import com.starrocks.common.ThreadPoolManager;
 import com.starrocks.common.util.FrontendDaemon;
+import com.starrocks.connector.DatabaseTableName;
 import com.starrocks.connector.HdfsEnvironment;
 import com.starrocks.connector.iceberg.procedure.ExpireSnapshotsProcedure;
 import com.starrocks.connector.iceberg.procedure.IcebergTableProcedureContext;
@@ -31,7 +32,9 @@ import org.apache.logging.log4j.Logger;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 
@@ -108,7 +111,7 @@ public class IcebergMaintenanceProcessor extends FrontendDaemon {
         long now = System.currentTimeMillis();
         ConnectContext ctx = new ConnectContext();
         for (IcebergMaintenanceInfo info : maintenanceInfoMap.values()) {
-            List<Pair<String, String>> tableNames = listTablesForMaintenance(info.catalog, ctx);
+            List<Pair<String, String>> tableNames = listTablesForMaintenance(info.catalogName, info.catalog, ctx);
             if (tableNames.isEmpty()) {
                 continue;
             }
@@ -135,7 +138,8 @@ public class IcebergMaintenanceProcessor extends FrontendDaemon {
         }
     }
 
-    private List<Pair<String, String>> listTablesForMaintenance(IcebergCatalog catalog, ConnectContext ctx) {
+    private List<Pair<String, String>> listTablesForMaintenance(String catalogName, IcebergCatalog catalog,
+                                                                ConnectContext ctx) {
         List<Pair<String, String>> result = Lists.newArrayList();
         try {
             List<String> dbs = catalog.listAllDatabases(ctx);
@@ -151,6 +155,17 @@ public class IcebergMaintenanceProcessor extends FrontendDaemon {
             }
         } catch (Exception e) {
             LOG.warn("List databases failed for catalog {}: {}", catalog.toString(), e.getMessage());
+        }
+
+        // Skip cold tables: only maintain tables accessed within iceberg_background_maintenance_time_secs_since_last_access_secs.
+        // Access time is recorded in IcebergMetadata.getTable() for all catalogs via IcebergTableAccessTimeTracker.
+        if (!result.isEmpty()) {
+            Set<DatabaseTableName> accessedWithinWindow =
+                    IcebergTableAccessTimeTracker.getInstance().getTableNamesAccessedWithinSecs(
+                            catalogName, Config.iceberg_background_maintenance_time_secs_since_last_access_secs);
+            result = result.stream()
+                    .filter(p -> accessedWithinWindow.contains(DatabaseTableName.of(p.first, p.second)))
+                    .collect(Collectors.toList());
         }
         return result;
     }

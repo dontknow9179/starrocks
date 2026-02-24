@@ -24,6 +24,7 @@ import com.starrocks.common.Config;
 import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.connector.ConnectorMetadatRequestContext;
 import com.starrocks.connector.ConnectorViewDefinition;
+import com.starrocks.connector.DatabaseTableName;
 import com.starrocks.connector.PlanMode;
 import com.starrocks.connector.exception.StarRocksConnectorException;
 import com.starrocks.connector.iceberg.rest.IcebergRESTCatalog;
@@ -87,7 +88,6 @@ public class CachingIcebergCatalog implements IcebergCatalog {
     private final com.github.benmanes.caffeine.cache.Cache<String, Set<DataFile>> dataFileCache;
     private final com.github.benmanes.caffeine.cache.Cache<String, Set<DeleteFile>> deleteFileCache;
     private final Map<IcebergTableName, Set<String>> metaFileCacheMap = new ConcurrentHashMap<>(); // table -> metadata file paths
-    private final Map<IcebergTableName, Long> tableLatestAccessTime = new ConcurrentHashMap<>();
     private final Map<IcebergTableName, Long> tableLatestRefreshTime = new ConcurrentHashMap<>();
 
     private final com.github.benmanes.caffeine.cache.LoadingCache<IcebergTableName, Map<String, Partition>> partitionCache;
@@ -259,10 +259,6 @@ public class CachingIcebergCatalog implements IcebergCatalog {
     @Override
     public Table getTable(ConnectContext connectContext, String dbName, String tableName) throws StarRocksConnectorException {
         IcebergTableName icebergTableName = new IcebergTableName(dbName, tableName);
-
-        if (ConnectContext.get() == null || ConnectContext.get().getCommand() == MysqlCommand.COM_QUERY) {
-            tableLatestAccessTime.put(icebergTableName, System.currentTimeMillis());
-        }
 
         // do not cache if jwt or oauth2 is not used OR if it is not a REST Catalog.
         boolean cacheAllowed = icebergProperties.isEnableIcebergTableCache() && 
@@ -465,12 +461,13 @@ public class CachingIcebergCatalog implements IcebergCatalog {
     }
 
     public void refreshCatalog() {
+        Set<DatabaseTableName> accessedWithinWindow =
+                IcebergTableAccessTimeTracker.getInstance().getTableNamesAccessedWithinSecs(
+                        catalogName, Config.background_refresh_metadata_time_secs_since_last_access_secs);
         List<IcebergTableName> identifiers = Lists.newArrayList(tables.asMap().keySet());
         for (IcebergTableName identifier : identifiers) {
             try {
-                Long latestAccessTime = tableLatestAccessTime.get(identifier);
-                if (latestAccessTime == null || (System.currentTimeMillis() - latestAccessTime) / 1000 >
-                        Config.background_refresh_metadata_time_secs_since_last_access_secs) {
+                if (!accessedWithinWindow.contains(DatabaseTableName.of(identifier.dbName, identifier.tableName))) {
                     invalidateCache(identifier);
                     continue;
                 }
@@ -507,7 +504,7 @@ public class CachingIcebergCatalog implements IcebergCatalog {
         tables.invalidate(key);
         // will invalidate all snapshots of this table
         partitionCache.invalidate(key);
-        tableLatestAccessTime.remove(key);
+        IcebergTableAccessTimeTracker.getInstance().removeAccess(catalogName, key.dbName, key.tableName);
         tableLatestRefreshTime.remove(key);
 
         Set<String> paths = metaFileCacheMap.remove(key);

@@ -2674,6 +2674,13 @@ public class Config extends ConfigBase {
     public static long background_refresh_metadata_time_secs_since_last_access_secs = 3600L * 24L;
 
     /**
+     * Tables not accessed within this many seconds are skipped by Iceberg background maintenance
+     * (expire_snapshots, remove_orphan_files, rewrite_manifests). Unit: second.
+     */
+    @ConfField(mutable = true)
+    public static long iceberg_background_maintenance_time_secs_since_last_access_secs = 3600L * 48L;
+
+    /**
      * Enable refresh hive partition statistics.
      * The `getPartitionColumnStats()` requests of hive metastore has a high latency, and some users env may return timeout.
      */
