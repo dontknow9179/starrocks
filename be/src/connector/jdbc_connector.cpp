@@ -151,8 +151,12 @@ Status JDBCDataSource::_create_scanner(RuntimeState* state) {
     scan_ctx.jdbc_url = jdbc_table->jdbc_url();
     scan_ctx.user = jdbc_table->jdbc_user();
     scan_ctx.passwd = jdbc_table->jdbc_passwd();
-    scan_ctx.sql = get_jdbc_sql(scan_ctx.jdbc_url, jdbc_scan_node.table_name, jdbc_scan_node.columns,
-                                jdbc_scan_node.filters, _read_limit);
+    if (jdbc_scan_node.__isset.sql) {
+        scan_ctx.sql = jdbc_scan_node.sql;
+    } else {
+        scan_ctx.sql = get_jdbc_sql(scan_ctx.jdbc_url, jdbc_scan_node.table_name, jdbc_scan_node.columns,
+                                    jdbc_scan_node.filters, _read_limit);
+    }
     _scanner = _pool->add(new JDBCScanner(scan_ctx, _tuple_desc, _runtime_profile));
 
     RETURN_IF_ERROR(_scanner->open(state));
